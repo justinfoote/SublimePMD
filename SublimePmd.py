@@ -9,7 +9,6 @@ import time
 import sublime
 import sublime_plugin
 
-RULESETS = ['basic', 'braces', 'empty', 'design', 'codesize', 'naming', 'strings', 'imports']
 _TEMP_DIR = tempfile.mkdtemp()
 
 ERROR = 'sublimePMD.error'
@@ -29,10 +28,14 @@ def getMessage(view):
         if region.contains(view.sel()[0]):
             return message
 
+class SettingsError(Exception):
+    pass
+
 
 class XLintParser:
     """The logic here was shamelessly ripped from SublimeLinter"""
-    ERROR_RE = re.compile(r'^(?P<path>.*\.java):(?P<line>\d+): (?P<warning>warning: )?(?:\[\w+\] )?(?P<error>.*)')
+    ERROR_RE = re.compile(r'^(?P<path>.*\.java):(?P<line>\d+): '
+            + r'(?P<warning>warning: )?(?:\[\w+\] )?(?P<error>.*)')
     MARK_RE = re.compile(r'^(?P<mark>\s*)\^$')
 
 
@@ -165,12 +168,14 @@ class PmdCommand(sublime_plugin.TextCommand):
 
     def _getPmdRulesets(self):
         rulesetPath = self.getSetting('ruleset_path')
+        rules = self.getSetting('rules')
         if rulesetPath:
             return rulesetPath
+        elif rules:
+            return ','.join('rulesets/java/{0}.xml'.format(r) for r in rules)
         else:
-            print 'failed'
-            return ','.join(
-            ['rulesets/java/{0}.xml'.format(r) for r in RULESETS])
+            raise SettingsError('Must specify either "ruleset_path" or "rules" '
+                    + 'in your settings.')
 
 
     def _doPmd(self):
@@ -181,8 +186,8 @@ class PmdCommand(sublime_plugin.TextCommand):
         script = os.path.join(sublime.packages_path(), 'SublimePMD', 
                 'pmd-bin-5.0.0', 'bin', 'run.sh')
         cmd = [script, 'pmd', fname, 'text', rulesets]
-        sub = subprocess.Popen(' '.join(cmd), shell = True, stdout = subprocess.PIPE, 
-                stderr = subprocess.STDOUT)
+        sub = subprocess.Popen(' '.join(cmd), shell = True, 
+                stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
         self._consumePmdOutput(sub)
 
 
@@ -194,7 +199,7 @@ class PmdCommand(sublime_plugin.TextCommand):
                 self.problems.append( 
                         (int(lineNumber), 0, WARNING, message.strip()) )
             except ValueError:
-                print 'error on line:: %s' % line
+                print 'error on line: %s' % line
             
 
     def _getInfoFromStdOutLine(self, line, fileName):
@@ -204,7 +209,6 @@ class PmdCommand(sublime_plugin.TextCommand):
             err = trimmed[len(str(lineNumber)):].lstrip()
             return int(lineNumber), err
         else:
-            print '%s does not contain %s' % (line, fileName)
             return 0, line
     
 
@@ -237,8 +241,8 @@ class PmdCommand(sublime_plugin.TextCommand):
 
     def _doXLint(self):
         fname = self.view.file_name()
-        path = ':'.join(self.getSetting('sublimejava_classpath') or [])
-
+        path = ':'.join(self.getSetting('java_classpath') or [])
+        
         command = 'javac -Xlint -classpath {path} -d {temp} {fname}'.format(
                 path = path, fname = fname, temp = _TEMP_DIR)
 

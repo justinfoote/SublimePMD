@@ -1,5 +1,11 @@
 {
 
+    // set to the classpath for the project -- this can be overridden in the
+    // project settings, rather than the user-specific settings
+    // this should be a list of strings, 
+    // like ['path to one dir', 'path to another']
+    "java_classpath": [],
+
     // if true, the java compiler will be run against the current file with the
     // XLint flag set
     "do_xlint": true,
