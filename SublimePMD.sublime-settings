@@ -1,0 +1,10 @@
+{
+    // The path to the custom ruleset file to be used when running PMD.  Will
+    // be ignored if empty.  
+    "ruleset_path": "",
+    // If ruleset_path is not set, the rulesets defined in this list will be 
+    // used.  This list should contain only the name of the ruleset to apply, 
+    // from the preconfigured PMD rulesets.  
+    // eg: ['strings', 'imports', 'naming']
+    "rules": []
+}
