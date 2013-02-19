@@ -4,6 +4,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 
 import sublime
 import sublime_plugin
@@ -89,10 +90,12 @@ class PmdCommand(sublime_plugin.TextCommand):
     def run(self, *args):
         self.window = self.view.window()
         self.problems.clear()
-        threads = [
-                threading.Thread(target = self._doXLint),
-                threading.Thread(target = self._doPmd)
-                ]
+        threads = []
+        if self.getSetting('do_xlint'):
+            threads.append(threading.Thread(target = self._doXLint))
+        if self.getSetting('do_pmd'):
+            threads.append(threading.Thread(target = self._doPmd))
+
         for t in threads:
             t.start()
 
@@ -106,39 +109,45 @@ class PmdCommand(sublime_plugin.TextCommand):
         for level in [ERROR, WARNING]:
             self.view.erase_regions(level)
 
-        out = self._getResultsPane(self.view)
-        edit = out.begin_edit()
-        try:
-            out.erase(edit, sublime.Region(0, out.size()))
-            self._append(out, edit, self.view.file_name() + ":\n")
-            toAdd = []
-            regions = defaultdict(list)
-            while messagesByView[self.view.id()]:
-                messagesByView[self.view.id()].pop(0)
-            for lnumber, position, level, message in sorted(self.problems, 
-                    key = lambda x: x[0]):
-                point = self.view.text_point(lnumber - 1, position + 1)
-                line = self.view.line(point)
-                region = line if position == 0 else self.view.word(point)
+        messagesForOutPane = []
+        regions = defaultdict(list)
+        while messagesByView[self.view.id()]:
+            messagesByView[self.view.id()].pop(0)
+        for lnumber, position, level, message in sorted(self.problems, 
+                key = lambda x: x[0]):
+            point = self.view.text_point(lnumber - 1, position + 1)
+            line = self.view.line(point)
+            region = line if position == 0 else self.view.word(point)
 
-                toAdd.append(self._formatMessage(lnumber, 
-                        self.view.substr(line), message))
-                messagesByView[self.view.id()].append( (region, message) )
-                regions[level].append(region)
-                
-            if regions:
-                print 'setting highlighting'
-                mark = 'circle'
-                style = FILL_STYLES.get('outline')
-                for level, errs in regions.iteritems():
-                    self.view.add_regions(level, errs, level, 
-                            mark, style)
+            messagesForOutPane.append(self._formatMessage(lnumber, 
+                    self.view.substr(line), message))
+            messagesByView[self.view.id()].append( (region, message) )
+            regions[level].append(region)
 
-            if toAdd:
-                print 'appending %s pmd errors' % len(toAdd)
-                self._append(out, edit, '\n'.join(toAdd))
-        finally:
-            out.end_edit(edit)
+            
+        if regions and self.getSetting('highlight'):
+            mark = 'circle' if self.getSetting("gutter_marks") else ''
+            style = FILL_STYLES.get(
+                    self.getSetting('highlight_style'), 'outline')
+            for level, errs in regions.iteritems():
+                self.view.add_regions(level, errs, level, 
+                        mark, style)
+                time.sleep(.100)
+
+        if self.getSetting('results_pane'):
+            out = self._getResultsPane(self.view)
+            edit = out.begin_edit()
+            try:
+                out.erase(edit, sublime.Region(0, out.size()))
+                self._append(out, edit, self.view.file_name() + ":\n")
+                if messagesForOutPane:
+                    print 'appending %s pmd errors' % len(messagesForOutPane)
+                    self._append(out, edit, '\n'.join(messagesForOutPane))
+                else:
+                    self._append(out, edit, '       -- pass -- ')
+
+            finally:
+                out.end_edit(edit)
 
 
     def _formatMessage(self, lineNumber, line, message):
