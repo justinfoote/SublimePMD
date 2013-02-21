@@ -37,6 +37,7 @@ class XLintParser:
     ERROR_RE = re.compile(r'^(?P<path>.*\.java):(?P<line>\d+): '
             + r'(?P<warning>warning: )?(?:\[\w+\] )?(?P<error>.*)')
     MARK_RE = re.compile(r'^(?P<mark>\s*)\^$')
+    END_RE = re.compile(r'[\d] error')
 
 
     def __init__(self, filename):
@@ -70,6 +71,12 @@ class XLintParser:
                         break
 
                 problems.append( (lineNumber, position, warning, message) )
+            elif re.match(self.END_RE, line):
+                continue
+            elif problems:
+                lnum, pos, warning, msg = problems[-1]
+                msg += '; ' + line.strip()
+                problems[-1] = (lnum, pos, warning, msg)
 
         return problems
 
@@ -81,12 +88,13 @@ class PmdCommand(sublime_plugin.TextCommand):
     problems = deque()
 
     def getSetting(self, name):
-        if SETTINGS.has(name):
-            return SETTINGS.get(name)
-
         settings = sublime.active_window().active_view().settings()
         if settings.has(name):
             return settings.get(name)
+            
+        if SETTINGS.has(name):
+            return SETTINGS.get(name)
+
         return None
 
 
@@ -144,7 +152,6 @@ class PmdCommand(sublime_plugin.TextCommand):
                 out.erase(edit, sublime.Region(0, out.size()))
                 self._append(out, edit, self.view.file_name() + ":\n")
                 if messagesForOutPane:
-                    print 'appending %s pmd errors' % len(messagesForOutPane)
                     self._append(out, edit, '\n'.join(messagesForOutPane))
                 else:
                     self._append(out, edit, '       -- pass -- ')
@@ -174,8 +181,8 @@ class PmdCommand(sublime_plugin.TextCommand):
         elif rules:
             return ','.join('rulesets/java/{0}.xml'.format(r) for r in rules)
         else:
-            raise SettingsError('Must specify either "ruleset_path" or "rules" '
-                    + 'in your settings.')
+            return os.path.join(sublime.packages_path(), 'SublimePMD', 
+                    'example.ruleset.xml')
 
 
     def _doPmd(self):
