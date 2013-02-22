@@ -248,7 +248,7 @@ class PmdCommand(sublime_plugin.TextCommand):
 
     def _doXLint(self):
         fname = self.view.file_name()
-        path = ':'.join(self.getSetting('java_classpath') or [])
+        path = ':'.join(self.getSetting('java_classpath') or ['.'])
         
         command = 'javac -Xlint -classpath {path} -d {temp} {fname}'.format(
                 path = path, fname = fname, temp = _TEMP_DIR)
