@@ -192,7 +192,8 @@ class PmdCommand(sublime_plugin.TextCommand):
         rulesets = self._getPmdRulesets()
         script = os.path.join(sublime.packages_path(), 'SublimePMD', 
                 'pmd-bin-5.0.0', 'bin', 'run.sh')
-        cmd = [script, 'pmd', fname, 'text', rulesets]
+        shell = open(script).readline().lstrip('#!').strip()
+        cmd = [shell, script, 'pmd', fname, 'text', rulesets]
         sub = subprocess.Popen(' '.join(cmd), shell = True, 
                 stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
         self._consumePmdOutput(sub)
