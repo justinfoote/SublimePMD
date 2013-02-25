@@ -1,4 +1,5 @@
 from collections import defaultdict, deque
+from itertools import cycle
 import os
 import re
 import subprocess
@@ -13,6 +14,7 @@ _TEMP_DIR = tempfile.mkdtemp()
 
 ERROR = 'sublimePMD.error'
 WARNING = 'sublimePMD.warning'
+SETTINGS = sublime.load_settings("SublimePMD.sublime-settings")
 
 FILL_STYLES = {
     'fill': sublime.DRAW_EMPTY,
@@ -28,26 +30,56 @@ def getMessage(view):
         if region.contains(view.sel()[0]):
             return message
 
+
+class Edit:
+    def __init__(self, view):
+        self.view = view
+
+
+    def __enter__(self):
+        self.edit = self.view.begin_edit()
+        return self.edit
+
+
+    def __exit__(self, type, value, traceback):
+        self.view.end_edit(self.edit)
+
+
 class SettingsError(Exception):
     pass
 
 
-class XLintParser:
+class Runner(threading.Thread):
+
+    def __init__(self, view, settingGetter, results):
+        threading.Thread.__init__(self)
+        self.view = view
+        self.getSetting = settingGetter
+        self.results = results
+
+
+class XLinter(Runner):
     """The logic here was shamelessly ripped from SublimeLinter"""
     ERROR_RE = re.compile(r'^(?P<path>.*\.java):(?P<line>\d+): '
             + r'(?P<warning>warning: )?(?:\[\w+\] )?(?P<error>.*)')
     MARK_RE = re.compile(r'^(?P<mark>\s*)\^$')
     END_RE = re.compile(r'[\d] error')
 
+    def run(self):
+        self.filename = self.view.file_name()
+        path = ':'.join(self.getSetting('java_classpath') or ['.'])
+        
+        command = 'javac -Xlint -classpath {path} -d {temp} {fname}'.format(
+                path = path, fname = self.filename, temp = _TEMP_DIR)
 
-    def __init__(self, filename):
-        self.filename = filename
+        p = subprocess.Popen(command, shell = True, stderr = subprocess.STDOUT,
+                stdout = subprocess.PIPE)
+        self._consumeXlintOutput(p)
 
 
-    def parse(self, lines):
+    def _consumeXlintOutput(self, proc):
         problems = []
-
-        for line in lines:
+        for line in proc.stdout:
             match = re.match(self.ERROR_RE, line)
             if match:
                 path = os.path.abspath(match.group('path'))
@@ -63,7 +95,7 @@ class XLintParser:
                 position = -1
 
                 while True:
-                    line = lines.next()
+                    line = proc.stdout.next()
                     match = re.match(self.MARK_RE, line)
 
                     if match:
@@ -78,10 +110,44 @@ class XLintParser:
                 msg += '; ' + line.strip()
                 problems[-1] = (lnum, pos, warning, msg)
 
-        return problems
+        for problem in problems:
+            self.results.append(problem)
+        
+
+class PMDer(Runner):
+    def _getPmdRulesets(self):
+        rulesetPath = self.getSetting('ruleset_path')
+        rules = self.getSetting('rules')
+        if rulesetPath:
+            return rulesetPath
+        elif rules:
+            return ','.join('rulesets/java/{0}.xml'.format(r) for r in rules)
+        else:
+            return os.path.join(sublime.packages_path(), 'SublimePMD', 
+                    'example.ruleset.xml')
 
 
-SETTINGS = sublime.load_settings("SublimePMD.sublime-settings")
+    def run(self):
+        fname = self.view.file_name()
+        rulesets = self._getPmdRulesets()
+        script = os.path.join(sublime.packages_path(), 'SublimePMD', 
+                'pmd-bin-5.0.0', 'bin', 'run.sh')
+        shell = open(script).readline().lstrip('#!').strip()
+        cmd = [shell, script, 'pmd', fname, 'text', rulesets]
+        sub = subprocess.Popen(' '.join(cmd), shell = True, 
+                stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
+        self._consumePmdOutput(sub)
+
+
+    def _consumePmdOutput(self, proc):
+        for line in proc.stdout:
+            try:
+                fname, line = line.split(':', 1)
+                lineNumber, message = line.split('\t', 1)
+                self.results.append( 
+                        (int(lineNumber), 0, WARNING, message.strip()) )
+            except ValueError:
+                print 'error on line: %s' % line
 
 
 class PmdCommand(sublime_plugin.TextCommand):
@@ -99,27 +165,64 @@ class PmdCommand(sublime_plugin.TextCommand):
 
 
     def run(self, *args):
+        # clear old display
+        for level in [ERROR, WARNING]:
+            self.view.erase_regions(level)
+
+        # get set up
         self.window = self.view.window()
         self.problems.clear()
-        threads = []
-        if self.getSetting('do_xlint'):
-            threads.append(threading.Thread(target = self._doXLint))
-        if self.getSetting('do_pmd'):
-            threads.append(threading.Thread(target = self._doPmd))
+        self.getSetting('')
 
-        for t in threads:
+        # run in new thread
+        threading.Thread(target = self._run).start()
+
+
+    def _run(self):
+        self.startSpinner()
+
+        runners = []
+        if self.getSetting('do_xlint'):
+            runners.append(XLinter(self.view, self.getSetting, self.problems))
+        if self.getSetting('do_pmd'):
+            runners.append(PMDer(self.view, self.getSetting, self.problems))
+
+        for t in runners:
             t.start()
 
-        while threads:
-            threads.pop(0).join()
+        while runners:
+            runners.pop(0).join()
+
+        time.sleep(2)
+        self.stopSpinner()
 
         self._printProblems()
 
 
-    def _printProblems(self):
-        for level in [ERROR, WARNING]:
-            self.view.erase_regions(level)
+    def startSpinner(self):
+        out = self._getResultsPane(self.view)
+        with Edit(out) as edit:
+            out.erase(edit, sublime.Region(0, out.size()))
+            self._append(out, edit, self.view.file_name() + ":\n\n")
 
+        chars = cycle(['[  ]', '[- ]', '[--]', '[ -]'])
+
+        def spin():
+            with Edit(out) as edit:
+                line = out.line(out.text_point(2, 0))
+                out.replace(edit, line, chars.next())
+            if not self.spinnerShouldStop:
+                sublime.set_timeout(spin, 200)
+
+        self.spinnerShouldStop = False
+        sublime.set_timeout(spin, 0)
+
+
+    def stopSpinner(self):
+        self.spinnerShouldStop = True
+        
+
+    def _printProblems(self):
         messagesForOutPane = []
         regions = defaultdict(list)
         while messagesByView[self.view.id()]:
@@ -147,8 +250,7 @@ class PmdCommand(sublime_plugin.TextCommand):
 
         if self.getSetting('results_pane'):
             out = self._getResultsPane(self.view)
-            edit = out.begin_edit()
-            try:
+            with Edit(out) as edit:
                 out.erase(edit, sublime.Region(0, out.size()))
                 self._append(out, edit, self.view.file_name() + ":\n")
                 if messagesForOutPane:
@@ -156,16 +258,13 @@ class PmdCommand(sublime_plugin.TextCommand):
                 else:
                     self._append(out, edit, '       -- pass -- ')
 
-            finally:
-                out.end_edit(edit)
-
 
     def _formatMessage(self, lineNumber, line, message):
         # lineNumber += 1
 
         if len(line) > 80:
             line = line[:77] + '...'
-        spacer1 = ' ' * (4 - len(str(lineNumber)))
+        spacer1 = ' ' * (5 - len(str(lineNumber)))
         spacer2 = ' ' * (81 - len(line))
         
         return '{sp1}{lineNumber}: {text}{sp2}{message}'.format(
@@ -173,60 +272,17 @@ class PmdCommand(sublime_plugin.TextCommand):
                 sp2 = spacer2, message = message)
 
 
-    def _getPmdRulesets(self):
-        rulesetPath = self.getSetting('ruleset_path')
-        rules = self.getSetting('rules')
-        if rulesetPath:
-            return rulesetPath
-        elif rules:
-            return ','.join('rulesets/java/{0}.xml'.format(r) for r in rules)
-        else:
-            return os.path.join(sublime.packages_path(), 'SublimePMD', 
-                    'example.ruleset.xml')
+    def _raiseOutputPane(self, outputPane, basePane):
+        self.window.focus_view(outputPane)
+        self.window.focus_view(basePane)
 
-
-    def _doPmd(self):
-        # lnumberToErrors = defaultdict(list)
-
-        fname = self.view.file_name()
-        rulesets = self._getPmdRulesets()
-        script = os.path.join(sublime.packages_path(), 'SublimePMD', 
-                'pmd-bin-5.0.0', 'bin', 'run.sh')
-        shell = open(script).readline().lstrip('#!').strip()
-        cmd = [shell, script, 'pmd', fname, 'text', rulesets]
-        sub = subprocess.Popen(' '.join(cmd), shell = True, 
-                stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
-        self._consumePmdOutput(sub)
-
-
-    def _consumePmdOutput(self, proc):
-        for line in proc.stdout:
-            try:
-                fname, line = line.split(':', 1)
-                lineNumber, message = line.split('\t', 1)
-                self.problems.append( 
-                        (int(lineNumber), 0, WARNING, message.strip()) )
-            except ValueError:
-                print 'error on line: %s' % line
-            
-
-    def _getInfoFromStdOutLine(self, line, fileName):
-        if line[:len(fileName)] == fileName:
-            trimmed = line[len(fileName) + 1:]
-            lineNumber = trimmed.split()[0]
-            err = trimmed[len(str(lineNumber)):].lstrip()
-            return int(lineNumber), err
-        else:
-            return 0, line
-    
 
     def _getResultsPane(self, view):
         resultsPane = [v for v in self.window.views() 
                 if v.name() == 'PMD Results']
         if resultsPane:
             v = resultsPane[0]
-            self.window.focus_view(v)
-            self.window.focus_view(view)
+            sublime.set_timeout(lambda: self._raiseOutputPane(v, self.view), 0)
             return v
 
         # otherwise, create a new view, and name it 'PMD Results'
@@ -247,24 +303,7 @@ class PmdCommand(sublime_plugin.TextCommand):
         sublime.set_timeout(_actuallyAppend, 0)
 
 
-    def _doXLint(self):
-        fname = self.view.file_name()
-        path = ':'.join(self.getSetting('java_classpath') or ['.'])
-        
-        command = 'javac -Xlint -classpath {path} -d {temp} {fname}'.format(
-                path = path, fname = fname, temp = _TEMP_DIR)
 
-        p = subprocess.Popen(command, shell = True, stderr = subprocess.STDOUT,
-                stdout = subprocess.PIPE)
-        self._consumeXlintOutput(p)
-
-
-    def _consumeXlintOutput(self, proc):
-        parser = XLintParser(self.view.file_name())
-        problems = parser.parse(proc.stdout)
-
-        for problem in problems:
-            self.problems.append(problem)
 
 
 
