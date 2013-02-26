@@ -193,7 +193,6 @@ class PmdCommand(sublime_plugin.TextCommand):
         while runners:
             runners.pop(0).join()
 
-        time.sleep(2)
         self.stopSpinner()
 
         self._printProblems()
@@ -208,18 +207,21 @@ class PmdCommand(sublime_plugin.TextCommand):
         chars = cycle(['[  ]', '[- ]', '[--]', '[ -]'])
 
         def spin():
+            if not self.keepSpinning:
+                return
+            
             with Edit(out) as edit:
                 line = out.line(out.text_point(2, 0))
                 out.replace(edit, line, chars.next())
-            if not self.spinnerShouldStop:
-                sublime.set_timeout(spin, 200)
+            
+            sublime.set_timeout(spin, 200)
 
-        self.spinnerShouldStop = False
+        self.keepSpinning = True
         sublime.set_timeout(spin, 0)
 
 
     def stopSpinner(self):
-        self.spinnerShouldStop = True
+        self.keepSpinning = False
         
 
     def _printProblems(self):
@@ -291,6 +293,7 @@ class PmdCommand(sublime_plugin.TextCommand):
         results.settings().set('syntax', os.path.join(
                 'Packages', 'Default', 'Find Results.hidden-tmLanguage'))
         results.settings().set('rulers', [6, 86])
+        results.settings().set('draw_indent_guides', False)
         results.set_scratch(True)
         return results
 
