@@ -9,18 +9,18 @@
   </description>
 
   <rule ref="rulesets/java/strings.xml">
-    <exclude ref="UseStringBufferLength" />
+    <exclude name="UseStringBufferLength" />
   </rule>
   <rule ref="rulesets/java/basic.xml">
-    <exclude ref="EmptyCatchBlock" />
+    <exclude name="EmptyCatchBlock" />
   </rule>
   <rule ref="rulesets/java/braces.xml"/>
   <rule ref="rulesets/java/empty.xml"/>
   <rule ref="rulesets/java/design.xml">
-    <exclude ref="ConstructorCallsOverridableMethod" />
+    <exclude name="ConstructorCallsOverridableMethod" />
   </rule>
   <rule ref="rulesets/java/codesize.xml">
-    <exclude ref="CyclomaticComplexity" />
+    <exclude name="CyclomaticComplexity" />
   </rule>
   <rule ref="rulesets/java/naming.xml">
     <exclude name="AbstractNaming" />
