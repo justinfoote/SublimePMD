@@ -24,6 +24,8 @@ FILL_STYLES = {
 
 messagesByView = defaultdict(list)
 
+problemsLock = threading.RLock()
+
 def getMessage(view):
     messages = messagesByView[view.id()]
     for region, message in messages:
@@ -69,7 +71,7 @@ class XLinter(Runner):
         self.filename = self.view.file_name()
         path = ':'.join(self.getSetting('java_classpath') or ['.'])
         
-        command = 'javac -Xlint -classpath {path} -d {temp} {fname}'.format(
+        command = 'javac -g -Xlint -classpath {path} -d {temp} {fname}'.format(
                 path = path, fname = self.filename, temp = _TEMP_DIR)
 
         p = subprocess.Popen(command, shell = True, stderr = subprocess.STDOUT,
@@ -78,14 +80,12 @@ class XLinter(Runner):
 
 
     def _consumeXlintOutput(self, proc):
-        problems = []
+        problems = defaultdict(list)
         for line in proc.stdout:
             match = re.match(self.ERROR_RE, line)
+            path = ''
             if match:
                 path = os.path.abspath(match.group('path'))
-
-                if path != self.filename:
-                    continue
 
                 lineNumber = int(match.group('line'))
                 warning = WARNING if match.group('warning') else ERROR
@@ -102,16 +102,19 @@ class XLinter(Runner):
                         position = len(match.group('mark'))
                         break
 
-                problems.append( (lineNumber, position, warning, message) )
+                problems[path].append( dict(level = warning,
+                        message = message, sourceLineNumber = lineNumber,
+                        sourcePosition = position) )
+
             elif re.match(self.END_RE, line):
                 continue
-            elif problems:
-                lnum, pos, warning, msg = problems[-1]
-                msg += '; ' + line.strip()
-                problems[-1] = (lnum, pos, warning, msg)
+            elif path and problems[path]:
+                problems[path][-1][message] += ('; ' + line.strip())
 
-        for problem in problems:
-            self.results.append(problem)
+
+        for fname, lines in problems.items():
+            with problemsLock:
+                self.results[fname].extend(lines)
         
 
 class PMDer(Runner):
@@ -123,18 +126,24 @@ class PMDer(Runner):
         elif rules:
             return ','.join('rulesets/java/{0}.xml'.format(r) for r in rules)
         else:
-            return os.path.join(sublime.packages_path(), 'SublimePMD', 
-                    'example.ruleset.xml')
+            return self._getPath('example.ruleset.xml')
+
+
+    def _getPath(self, *args):
+        return os.path.join(sublime.packages_path(), 'SublimePMD', *args)
 
 
     def run(self):
         fname = self.view.file_name()
         rulesets = self._getPmdRulesets()
-        script = os.path.join(sublime.packages_path(), 'SublimePMD', 
-                'pmd-bin-5.0.0', 'bin', 'run.sh')
-        shell = open(script).readline().lstrip('#!').strip()
-        cmd = [shell, script, 'pmd', fname, 'text', rulesets]
-        sub = subprocess.Popen(' '.join(cmd), shell = True, 
+
+        classpath = ':'.join([ self._getPath('pmd-bin-5.0.0', 'lib', f) 
+                for f in os.listdir(self._getPath('pmd-bin-5.0.0', 'lib'))
+                if f.endswith('.jar')])
+
+        cmd = ['java', '-classpath', classpath, 
+                'net.sourceforge.pmd.PMD', fname, 'text', rulesets]
+        sub = subprocess.Popen(cmd,
                 stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
         self._consumePmdOutput(sub)
 
@@ -144,14 +153,32 @@ class PMDer(Runner):
             try:
                 fname, line = line.split(':', 1)
                 lineNumber, message = line.split('\t', 1)
-                self.results.append( 
-                        (int(lineNumber), 0, WARNING, message.strip()) )
+                with problemsLock:
+                    self.results[fname].append( dict(level = WARNING, 
+                            sourceLineNumber = int(lineNumber),
+                            message = message.strip(),
+                            sourcePosition = 0) )
             except ValueError:
                 print 'error on line: %s' % line
 
 
 class PmdCommand(sublime_plugin.TextCommand):
-    problems = deque()
+    problems = defaultdict(deque)
+    problems__doc = """problems is a deque of dicts.  each entry is a key of 
+            filename to a list of dicts.  each dict in that list represents a 
+            problem found in a source file, and has these mandatory keys:
+            
+            level -- one of WARNING or ERROR
+            message -- string; the message from either XLint or PMD
+            sourceLineNumber -- int; the line number where the problem was found
+            soucePosition -- int; the column number where the problem was found
+
+            And these optional key:
+
+            sourceLine -- string; the line from the source file where the 
+                    problem was found
+            """
+
 
     def getSetting(self, name):
         settings = sublime.active_window().active_view().settings()
@@ -164,7 +191,9 @@ class PmdCommand(sublime_plugin.TextCommand):
         return None
 
 
-    def run(self, *args):
+    def run(self, current_file = False, *args):
+        print current_file
+        print args
         # clear old display
         for level in [ERROR, WARNING]:
             self.view.erase_regions(level)
@@ -199,7 +228,7 @@ class PmdCommand(sublime_plugin.TextCommand):
 
 
     def startSpinner(self):
-        out = self._getResultsPane(self.view)
+        out = self._getResultsPane('PMD Results')
         with Edit(out) as edit:
             out.erase(edit, sublime.Region(0, out.size()))
             self._append(out, edit, self.view.file_name() + ":\n\n")
@@ -229,16 +258,25 @@ class PmdCommand(sublime_plugin.TextCommand):
         regions = defaultdict(list)
         while messagesByView[self.view.id()]:
             messagesByView[self.view.id()].pop(0)
-        for lnumber, position, level, message in sorted(self.problems, 
-                key = lambda x: x[0]):
-            point = self.view.text_point(lnumber - 1, position + 1)
-            line = self.view.line(point)
-            region = line if position == 0 else self.view.word(point)
 
-            messagesForOutPane.append(self._formatMessage(lnumber, 
-                    self.view.substr(line), message))
-            messagesByView[self.view.id()].append( (region, message) )
-            regions[level].append(region)
+        for filename, problems in sorted(self.problems.items(), 
+                key = lambda x: x[0]):
+
+            for problem in sorted(problems, 
+                    key = lambda x: x['sourceLineNumber']):
+                point = self.view.text_point(problem['sourceLineNumber'] - 1, 
+                        problem['sourcePosition'] + 1)
+                line = self.view.line(point)
+                region = (line if problem['sourcePosition'] == 0 
+                        else self.view.word(point))
+                problem['sourceLine'] = self.view.substr(line)
+
+                if filename == self.view.file_name():
+                    messagesForOutPane.append(problem)
+
+                    messagesByView[self.view.id()].append( (region, 
+                            problem['message']) )
+                    regions[problem['level']].append(region)
 
             
         if regions and self.getSetting('highlight'):
@@ -251,19 +289,32 @@ class PmdCommand(sublime_plugin.TextCommand):
                 time.sleep(.100)
 
         if self.getSetting('results_pane'):
-            out = self._getResultsPane(self.view)
+            out = self._getResultsPane('PMD Results')
             with Edit(out) as edit:
-                out.erase(edit, sublime.Region(0, out.size()))
-                self._append(out, edit, self.view.file_name() + ":\n")
-                if messagesForOutPane:
-                    self._append(out, edit, '\n'.join(messagesForOutPane))
-                else:
+                out.replace(edit, sublime.Region(0, out.size()),
+                        self.view.file_name() + ":\n\n")
+                outPaneMarks = defaultdict(list)
+                for problem in messagesForOutPane:
+                    start = out.size()
+                    size = out.insert(edit, start, 
+                            self._formatMessage(problem))
+                    out.insert(edit, out.size(), '\n')
+                    outPaneMarks[problem['level']].append(
+                        sublime.Region(start + 1, start + 1 + size))
+
+                for level, regions in outPaneMarks.items():
+                    print regions
+                    out.add_regions(level, regions, level, 'dot',
+                        sublime.HIDDEN)
+                    time.sleep(0.1)
+
+                if not messagesForOutPane:
                     self._append(out, edit, '       -- pass -- ')
 
 
-    def _formatMessage(self, lineNumber, line, message):
-        # lineNumber += 1
-
+    def _formatMessage(self, problem): 
+        line = problem['sourceLine']
+        lineNumber = problem['sourceLineNumber']
         if len(line) > 80:
             line = line[:77] + '...'
         spacer1 = ' ' * (5 - len(str(lineNumber)))
@@ -271,17 +322,18 @@ class PmdCommand(sublime_plugin.TextCommand):
         
         return '{sp1}{lineNumber}: {text}{sp2}{message}'.format(
                 lineNumber = lineNumber, text = line, sp1 = spacer1,
-                sp2 = spacer2, message = message)
+                sp2 = spacer2, message = problem['message'])
 
 
     def _raiseOutputPane(self, outputPane, basePane):
-        self.window.focus_view(outputPane)
-        self.window.focus_view(basePane)
+        if (basePane.window().active_view().id() == basePane.id()):
+            self.window.focus_view(outputPane)
+            self.window.focus_view(basePane)
 
 
-    def _getResultsPane(self, view):
+    def _getResultsPane(self, name):
         resultsPane = [v for v in self.window.views() 
-                if v.name() == 'PMD Results']
+                if v.name() == name]
         if resultsPane:
             v = resultsPane[0]
             sublime.set_timeout(lambda: self._raiseOutputPane(v, self.view), 0)
@@ -289,7 +341,7 @@ class PmdCommand(sublime_plugin.TextCommand):
 
         # otherwise, create a new view, and name it 'PMD Results'
         results = self.window.new_file()
-        results.set_name('PMD Results')
+        results.set_name(name)
         results.settings().set('syntax', os.path.join(
                 'Packages', 'Default', 'Find Results.hidden-tmLanguage'))
         results.settings().set('rulers', [6, 86])
@@ -304,10 +356,6 @@ class PmdCommand(sublime_plugin.TextCommand):
             if newline:
                 view.insert(edit, view.size(), '\n')
         sublime.set_timeout(_actuallyAppend, 0)
-
-
-
-
 
 
 class SublimePMDBackground(sublime_plugin.EventListener):
